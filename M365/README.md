@@ -1,7 +1,8 @@
 ## Requirements
 
 * `PowerShell >= 5.1` for PowerShell Gallery.
-* Microsoft user permissions to run this script: Global Reader and Reports Reader
+* For delegated user access, sign in with a user that has the Microsoft Graph delegated scopes `Reports.Read.All`, `User.Read.All`, and `Group.Read.All`.
+* For delegated user access, that same user should also have a Microsoft 365 admin role that can read usage reports, such as `Reports Reader` or `Global Reader`.
 
 * There are two ways users can authenticate to Exchange Online:
 * 1. App access:
@@ -14,15 +15,16 @@
 
 * 2. User access:
 *     Login through the admin user account when prompted on the browser.
+*     The script will connect to Exchange Online with WAM disabled when the installed module supports it, which avoids a known MSAL broker error on some Windows systems.
 
 
 ## Installation
 
 1. Download the [Get-RubrikM365SizingInfo.ps1](https://github.com/rubrikinc/microsoft-365-sizing/archive/refs/heads/main.zip) PowerShell script to your local machine
-2. Install the `Microsoft.Graph.Reports` and `ExchangeOnlineManagement` modules from the PowerShell Gallery
+2. Install the `Microsoft.Graph.Reports`, `Microsoft.Graph.Authentication`, and `ExchangeOnlineManagement` modules from the PowerShell Gallery
 
 ```powershell
-Install-Module Microsoft.Graph.Reports, Microsoft.Graph.Groups, ExchangeOnlineManagement
+Install-Module Microsoft.Graph.Reports, Microsoft.Graph.Authentication, Microsoft.Graph.Groups, ExchangeOnlineManagement
 ```
 
 ## Usage

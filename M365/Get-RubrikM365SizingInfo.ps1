@@ -333,28 +333,301 @@ if ($Period -in $PeriodValues) {
     throw "Error: Period (days) needs to be: 7, 30, 90, or 180"
 }
 
-# Validate the required 'Microsoft.Graph.Reports' is installed
-# and provide a user friendly message when it's not.
-if (Get-Module -ListAvailable -Name Microsoft.Graph.Reports) {
-} else {
-  throw "The 'Microsoft.Graph.Reports' module is required for this script. Run the follow command to install: Install-Module Microsoft.Graph.Reports"
+function Import-RequiredModule {
+    param (
+        [Parameter(Mandatory)]
+        [string]$Name,
+        [Parameter(Mandatory)]
+        [string]$InstallCommand,
+        [Parameter()]
+        [version]$MinimumVersion
+    )
+
+    $availableModules = @(Get-Module -ListAvailable -Name $Name | Sort-Object Version -Descending)
+    if ($availableModules.Count -eq 0) {
+        throw "The '$Name' module is required for this script. Install it with: $InstallCommand"
+    }
+
+    $selectedModule = $availableModules[0]
+    if ($MinimumVersion -and $selectedModule.Version -lt $MinimumVersion) {
+        throw "The '$Name' module version $($selectedModule.Version) is too old for this script. Update it with: $InstallCommand"
+    }
+
+    Import-Module $selectedModule.Path -ErrorAction Stop | Out-Null
+    return $selectedModule.Version
 }
 
-# Validate the required 'ExchangeOnlineManagement' is installed and provide a user friendly message when it's not.
-if (Get-Module -ListAvailable -Name ExchangeOnlineManagement) {
-} else {
-  throw "The 'ExchangeOnlineManagement' module is required for this script. Run the follow command to install: Install-Module ExchangeOnlineManagement"
+function Write-DelegatedAccessRequirements {
+    Write-Host "You have chosen to authenticate through delegated user access for accessing Microsoft 365."
+    Write-Host "[INFO] Sign in with a user that has the Microsoft Graph delegated scopes:" 
+    Write-Host "'Reports.Read.All', 'User.Read.All', and 'Group.Read.All'."
+    Write-Host "[INFO] That user should also have the Microsoft 365 admin roles required to read usage reports (for example, Reports Reader or Global Reader)."
 }
+
+function Connect-MgGraphInteractive {
+    param (
+        [Parameter(Mandatory)]
+        [string[]]$Scopes
+    )
+
+    try {
+        Connect-MgGraph -Scopes $Scopes -NoWelcome -ErrorAction Stop | Out-Null
+        return
+    }
+    catch {
+        $errorMessage = $_.Exception.Message
+        Write-Host "[WARN] Browser-based Microsoft Graph sign-in failed: $errorMessage"
+        Write-Host "[INFO] Retrying Microsoft Graph sign-in with device code authentication."
+    }
+
+    Connect-MgGraph -Scopes $Scopes -UseDeviceCode -NoWelcome -ErrorAction Stop | Out-Null
+}
+
+function Connect-ExchangeOnlineInteractive {
+    $exoCommand = Get-Command -Name Connect-ExchangeOnline -ErrorAction Stop
+    $connectParams = @{
+        ShowBanner = $false
+    }
+
+    if ($exoCommand.Parameters.ContainsKey('DisableWAM')) {
+        $connectParams.DisableWAM = $true
+        Write-Host "[INFO] Connecting to Exchange Online with WAM disabled to avoid known MSAL broker conflicts with Microsoft Graph PowerShell."
+    }
+
+    Connect-ExchangeOnline @connectParams
+}
+
+function Invoke-ExchangeOnlineIsolatedCollection {
+    param (
+        [Parameter(Mandatory)]
+        [array]$ArchiveMailboxes,
+        [Parameter(Mandatory)]
+        [array]$RecoverableItemsMailboxes,
+        [Parameter()]
+        [bool]$SkipArchiveMailbox = $false,
+        [Parameter()]
+        [bool]$SkipRecoverableItems = $false,
+        [Parameter()]
+        [bool]$EnableDebug = $false
+    )
+
+    $tempRoot = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ("RubrikM365Sizing-" + [guid]::NewGuid().ToString())
+    $null = New-Item -ItemType Directory -Path $tempRoot -Force
+    $inputPath = Join-Path -Path $tempRoot -ChildPath 'exchange-input.json'
+    $outputPath = Join-Path -Path $tempRoot -ChildPath 'exchange-output.json'
+    $helperScriptPath = Join-Path -Path $tempRoot -ChildPath 'exchange-collector.ps1'
+
+    $inputPayload = [ordered]@{
+        SkipArchiveMailbox = $SkipArchiveMailbox
+        SkipRecoverableItems = $SkipRecoverableItems
+        EnableDebug = $EnableDebug
+        ArchiveMailboxes = @($ArchiveMailboxes)
+        RecoverableItemsMailboxes = @($RecoverableItemsMailboxes)
+    }
+    $inputPayload | ConvertTo-Json -Depth 6 | Set-Content -Path $inputPath -Encoding UTF8
+
+    $helperScript = @'
+param (
+    [Parameter(Mandatory)]
+    [string]$InputPath,
+    [Parameter(Mandatory)]
+    [string]$OutputPath
+)
+
+$ErrorActionPreference = 'Stop'
+
+function Connect-ExchangeOnlineInteractive {
+    $exoCommand = Get-Command -Name Connect-ExchangeOnline -ErrorAction Stop
+    $connectParams = @{
+        ShowBanner = $false
+    }
+
+    if ($exoCommand.Parameters.ContainsKey('DisableWAM')) {
+        $connectParams.DisableWAM = $true
+        Write-Host '[INFO] Connecting to Exchange Online with WAM disabled to avoid known MSAL broker conflicts with Microsoft Graph PowerShell.'
+    }
+
+    Connect-ExchangeOnline @connectParams
+}
+
+function Get-RecoverableItemsInfo {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Mailbox,
+        [Parameter(Mandatory = $true)]
+        [bool]$IncludeArchiveMailbox,
+        [Parameter()]
+        [bool]$EnableDebug = $false
+    )
+
+    $RIFItemsStatistics = [PSCustomObject]@{
+        UserPrincipalName = $Mailbox
+        RIFSize = 0
+        RIFItems = 0
+    }
+
+    $recoverableItemsSpecialFolders = @(
+        '/Deletions',
+        '/Purges',
+        '/Versions',
+        '/DiscoveryHolds'
+    )
+
+    $primaryStats = @(Get-MailboxFolderStatistics -Identity $Mailbox -FolderScope RecoverableItems | Where-Object {
+        $recoverableItemsSpecialFolders -contains $_.FolderPath
+    })
+
+    $inPlaceStats = @()
+    if ($IncludeArchiveMailbox) {
+        $inPlaceStats = @(Get-MailboxFolderStatistics -Identity $Mailbox -FolderScope RecoverableItems -Archive | Where-Object {
+            $recoverableItemsSpecialFolders -contains $_.FolderPath
+        })
+    }
+
+    $folderStats = @($primaryStats + $inPlaceStats)
+    foreach ($stats in $folderStats) {
+        $null = $stats.FolderSize -match '\(([^)]+) bytes\)'
+        $sizeInBytes = [long]($Matches[1] -replace ',', '')
+        $RIFItemsStatistics.RIFSize += $sizeInBytes
+        if ($EnableDebug) {
+            Write-Host "[DEBUG] Recoverable Items folder $($stats.FolderPath) size found $sizeInBytes bytes for $Mailbox"
+        }
+    }
+
+    $totalItems = $folderStats | Measure-Object -Property 'ItemsInFolder' -Sum
+    $RIFItemsStatistics.RIFItems += $totalItems.Sum
+    return $RIFItemsStatistics
+}
+
+function Get-RIFMailboxStats {
+    param (
+        [Parameter(Mandatory = $true)]
+        [array]$ExchangeUsers,
+        [Parameter()]
+        [bool]$EnableDebug = $false
+    )
+
+    $RIFMailboxList = @()
+    $CurrentMailboxNum = 0
+    $ActiveMailboxesCount = $ExchangeUsers.Count
+
+    if ($ActiveMailboxesCount -eq 0) {
+        return @()
+    }
+
+    Write-Host "Found $ActiveMailboxesCount mailboxes with Recoverable Items" -ForegroundColor Green
+    do {
+        if (($CurrentMailboxNum % 10) -eq 0) {
+            Write-Host "[$CurrentMailboxNum / $ActiveMailboxesCount] Processing mailboxes ..."
+        }
+
+        $mailbox = $ExchangeUsers[$CurrentMailboxNum]
+        try {
+            $RIFMailboxList += Get-RecoverableItemsInfo -Mailbox $mailbox.UserPrincipalName -IncludeArchiveMailbox ([bool]$mailbox.IncludeArchiveMailbox) -EnableDebug $EnableDebug
+        } catch {
+            Write-Error "Error getting Recoverable Items info for mailbox: $($mailbox.UserPrincipalName). $_"
+        }
+
+        $CurrentMailboxNum += 1
+    } while ($CurrentMailboxNum -lt $ActiveMailboxesCount)
+
+    return $RIFMailboxList
+}
+
+$exoModule = Get-Module -ListAvailable -Name ExchangeOnlineManagement | Sort-Object Version -Descending | Select-Object -First 1
+if (-not $exoModule) {
+    throw 'ExchangeOnlineManagement is required in the isolated session.'
+}
+
+Import-Module $exoModule.Path -ErrorAction Stop | Out-Null
+$inputData = Get-Content -Path $InputPath -Raw | ConvertFrom-Json
+$result = [ordered]@{
+    ArchiveMailboxes = @()
+    RecoverableItemsMailboxes = @()
+}
+
+try {
+    Connect-ExchangeOnlineInteractive
+
+    if (-not [bool]$inputData.SkipArchiveMailbox) {
+        $ArchiveMailboxList = @()
+        $CurrentMailboxNum = 0
+        $ArchiveMailboxes = @($inputData.ArchiveMailboxes)
+        $ArchiveMailboxesCount = $ArchiveMailboxes.Count
+        Write-Host '[INFO] Retrieving all Exchange Mailbox In-Place Archive sizing'
+        Write-Host "Found $ArchiveMailboxesCount mailboxes with In Place Archives" -ForegroundColor Green
+
+        while ($CurrentMailboxNum -lt $ArchiveMailboxesCount) {
+            if (($CurrentMailboxNum % 10) -eq 0) {
+                Write-Host "[$CurrentMailboxNum / $ArchiveMailboxesCount] Processing mailboxes ..."
+            }
+
+            $CurrentUser = [string]$ArchiveMailboxes[$CurrentMailboxNum]
+            try {
+                $ArchiveMailboxStats = Get-EXOMailboxStatistics -Archive -Identity $CurrentUser
+                $null = $ArchiveMailboxStats.TotalItemSize -match '\(([^)]+) bytes\)'
+                $ArchiveMailboxList += [PSCustomObject]@{
+                    UserPrincipalName = $CurrentUser
+                    ArchiveSize = [long]($Matches[1] -replace ',', '')
+                    ArchiveItems = $ArchiveMailboxStats.ItemCount
+                }
+            } catch {
+                Write-Error "Error getting archive info for mailbox: $CurrentUser. $_"
+            }
+
+            $CurrentMailboxNum += 1
+        }
+
+        $result.ArchiveMailboxes = @($ArchiveMailboxList)
+    }
+
+    if (-not [bool]$inputData.SkipRecoverableItems) {
+        Write-Host '[INFO] Retrieving all Exchange Mailbox Recoverable Items sizing'
+        $result.RecoverableItemsMailboxes = @(Get-RIFMailboxStats -ExchangeUsers @($inputData.RecoverableItemsMailboxes) -EnableDebug ([bool]$inputData.EnableDebug))
+    }
+}
+finally {
+    if (Get-Command -Name Disconnect-ExchangeOnline -ErrorAction SilentlyContinue) {
+        Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
+    }
+}
+
+$result | ConvertTo-Json -Depth 6 | Set-Content -Path $OutputPath -Encoding UTF8
+'@
+
+    Set-Content -Path $helperScriptPath -Value $helperScript -Encoding UTF8
+
+    try {
+        $hostExecutable = (Get-Process -Id $PID).Path
+        & $hostExecutable -NoProfile -ExecutionPolicy Bypass -File $helperScriptPath -InputPath $inputPath -OutputPath $outputPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "The isolated Exchange Online collection process exited with code $LASTEXITCODE."
+        }
+
+        if (-not (Test-Path -Path $outputPath)) {
+            throw 'The isolated Exchange Online collection process did not produce an output file.'
+        }
+
+        return Get-Content -Path $outputPath -Raw | ConvertFrom-Json
+    }
+    finally {
+        Remove-Item -Path $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+$MicrosoftGraphReportsVersion = Import-RequiredModule -Name 'Microsoft.Graph.Reports' -InstallCommand 'Install-Module Microsoft.Graph.Reports -Scope CurrentUser'
+$MicrosoftGraphAuthenticationVersion = Import-RequiredModule -Name 'Microsoft.Graph.Authentication' -InstallCommand 'Install-Module Microsoft.Graph.Authentication -Scope CurrentUser'
+$ExchangeOnlineManagementVersion = Import-RequiredModule -Name 'ExchangeOnlineManagement' -InstallCommand 'Install-Module ExchangeOnlineManagement -Scope CurrentUser'
+
+Write-Host "[INFO] Using Microsoft.Graph.Reports module version $MicrosoftGraphReportsVersion"
+Write-Host "[INFO] Using Microsoft.Graph.Authentication module version $MicrosoftGraphAuthenticationVersion"
+Write-Host "[INFO] Using ExchangeOnlineManagement module version $ExchangeOnlineManagementVersion"
 
 $AzureAdRequired = $PSBoundParameters.ContainsKey('ADGroup') -or $PSBoundParameters.ContainsKey('ExcludeADGroup')
 
 if ($AzureAdRequired) {
-  # Validate the required 'Azure.Graph.Authentication' is installed
-  # and provide a user friendly message when it's not.
-  if (Get-Module -ListAvailable -Name Microsoft.Graph.Groups) {
-  } else {
-    throw "The 'Microsoft.Graph.Groups' module is required for filtering by a specific Azure AD Group. Run the follow command to install: Install-Module Microsoft.Graph.Groups"
-  }
+    $MicrosoftGraphGroupsVersion = Import-RequiredModule -Name 'Microsoft.Graph.Groups' -InstallCommand 'Install-Module Microsoft.Graph.Groups -Scope CurrentUser'
+    Write-Host "[INFO] Using Microsoft.Graph.Groups module version $MicrosoftGraphGroupsVersion"
 }
 
 if ($UseAppAccess -eq $true) {
@@ -391,11 +664,9 @@ if ($UseAppAccess -eq $true) {
         }
     }
 } else {
-    Write-Host "You have chosen to authenticate through delegate user access for accessing Exchange Online."
-    Write-Host "[INFO] Please authenticate through an user with the following permissions:"
-    Write-Host "'Reports.Read.All', 'User.Read.All', and 'Group.Read.All'."
+    Write-DelegatedAccessRequirements
     try {
-        Connect-MgGraph -Scopes "Reports.Read.All", "User.Read.All", "Group.Read.All"  | Out-Null
+        Connect-MgGraphInteractive -Scopes @("Reports.Read.All", "User.Read.All", "Group.Read.All")
     }
     catch {
         $errorException = $_.Exception
@@ -405,15 +676,7 @@ if ($UseAppAccess -eq $true) {
     }
 
     if ($SkipArchiveMailbox -eq $false -or $SkipRecoverableItems -eq $false) {
-        Write-Host "Connecting to the Microsoft Exchange Online Module to gather per-mailbox In Place Archive stats."
-        try {
-            Connect-ExchangeOnline -ShowBanner:$false
-        } catch {
-            $errorException = $_.Exception
-            $errorMessage = $errorException.Message
-            Write-Host "[ERROR] Unable to Connect to the Microsoft Exchange PowerShell Module: $errorMessage"
-            return
-        }
+        Write-Host "[INFO] Exchange Online mailbox-level data will be collected in a separate PowerShell session after Microsoft Graph reporting completes."
     }
 }
 
@@ -715,6 +978,27 @@ Disconnect-MgGraph
 $ArchiveMailboxes = $ExchangeUsageReportUsers | Where-Object { $_.'Has Archive' -eq 'TRUE' }
 $ArchiveMailboxesCount = $ArchiveMailboxes.Count
 
+$IsDelegatedAccess = $UseAppAccess -ne $true
+$IsolatedExchangeResults = $null
+if ($IsDelegatedAccess -and ($SkipArchiveMailbox -eq $false -or $SkipRecoverableItems -eq $false)) {
+    $RecoverableItemsMailboxes = $ExchangeActiveUsers | ForEach-Object {
+        [PSCustomObject]@{
+            UserPrincipalName = $_.'User Principal Name'
+            IncludeArchiveMailbox = ($_. 'Has Archive' -eq 'TRUE')
+        }
+    }
+
+    Write-Host "[INFO] Starting an isolated PowerShell session for Exchange Online mailbox-level data collection."
+    try {
+        $IsolatedExchangeResults = Invoke-ExchangeOnlineIsolatedCollection -ArchiveMailboxes @($ArchiveMailboxes.'User Principal Name') -RecoverableItemsMailboxes @($RecoverableItemsMailboxes) -SkipArchiveMailbox $SkipArchiveMailbox -SkipRecoverableItems $SkipRecoverableItems -EnableDebug $EnableDebug
+    } catch {
+        $errorException = $_.Exception
+        $errorMessage = $errorException.Message
+        Write-Host "[ERROR] Unable to collect Exchange mailbox-level data in an isolated PowerShell session: $errorMessage"
+        return
+    }
+}
+
 if ($SkipArchiveMailbox -eq $true) {
   Write-Host "Skipping gathering In Place Archive usage" -foregroundcolor green
 } else {
@@ -722,40 +1006,40 @@ if ($SkipArchiveMailbox -eq $true) {
   Write-Host "This may take awhile since stats need to be gathered per user" -foregroundcolor green
   Write-Host "Progress will be written as they are gathered" -foregroundcolor green
   Write-Host "If this keeps timing out, run script with -SkipArchiveMailbox $true option" -foregroundcolor green
-  $ConnectionUserPrincipalName = $(Get-ConnectionInformation).UserPrincipalName
-  # $ActionRequiredLogMessage = "[ACTION REQUIRED] In order to periodically refresh the connection to Microsoft, we need the User Principal Name used during the authentication process."
-  # $ActionRequiredPromptMessage = "Enter the User Principal Name"
-  $FirstInterval = 500
-  $SkipInternval = $FirstInterval
-  $ArchiveMailboxSizeGb = 0
-  $LargeAmountofArchiveMailboxCount = 5000
-  $FilterByField = 'User Principal Name'
-  Write-Host "[INFO] Retrieving all Exchange Mailbox In-Place Archive sizing"
-  # Get a list of all users with In Place Archive mailboxes in the tenant
-  # $ArchiveMailboxes = Get-ExoMailbox -Archive -ResultSize Unlimited
-  $ArchiveMailboxList = @()
-  $CurrentMailboxNum = 0
-  Write-Host "Found $ArchiveMailboxesCount mailboxes with In Place Archives" -foregroundcolor green
-  do {
-    if ( ($CurrentMailboxNum % 10) -eq 0 ) {
-      Write-Host "[$CurrentMailboxNum / $ArchiveMailboxesCount] Processing mailboxes ..."
+    if ($IsDelegatedAccess) {
+        $ArchiveMailboxList = @($IsolatedExchangeResults.ArchiveMailboxes)
+    } else {
+        $ConnectionUserPrincipalName = $(Get-ConnectionInformation).UserPrincipalName
+        $FirstInterval = 500
+        $SkipInternval = $FirstInterval
+        $ArchiveMailboxSizeGb = 0
+        $LargeAmountofArchiveMailboxCount = 5000
+        $FilterByField = 'User Principal Name'
+        Write-Host "[INFO] Retrieving all Exchange Mailbox In-Place Archive sizing"
+        $ArchiveMailboxList = @()
+        $CurrentMailboxNum = 0
+        Write-Host "Found $ArchiveMailboxesCount mailboxes with In Place Archives" -foregroundcolor green
+        do {
+            if ( ($CurrentMailboxNum % 10) -eq 0 ) {
+                Write-Host "[$CurrentMailboxNum / $ArchiveMailboxesCount] Processing mailboxes ..."
+            }
+            $CurrentUser = $ArchiveMailboxes[$CurrentMailboxNum].'User Principal Name'
+            try {
+                $ArchiveMailboxStats = Get-EXOMailboxStatistics -Archive -Identity $CurrentUser
+                $null = $ArchiveMailboxStats.TotalItemSize -match '\(([^)]+) bytes\)'
+                $ArchiveSize = [long]($Matches[1] -replace ',', '')
+                $ArchiveStats = [PSCustomObject] @{
+                    "UserPrincipalName" = $CurrentUser
+                    "ArchiveSize" = $ArchiveSize
+                    "ArchiveItems" = $ArchiveMailboxStats.ItemCount
+                }
+                $ArchiveMailboxList += $ArchiveStats
+            } catch {
+                Write-Error "Error getting info for mailbox: $CurrentUser"
+            }
+            $CurrentMailboxNum += 1
+        } while ($CurrentMailboxNum -lt $ArchiveMailboxesCount)
     }
-    $CurrentUser = $ArchiveMailboxes[$CurrentMailboxNum].'User Principal Name'
-    try {
-      $ArchiveMailboxStats = Get-EXOMailboxStatistics -Archive -Identity $CurrentUser
-      $MatchArchiveSize = $ArchiveMailboxStats.TotalItemSize -match '\(([^)]+) bytes\)'
-      $ArchiveSize = [long]($Matches[1] -replace ',', '')
-      $ArchiveStats = [PSCustomObject] @{
-        "UserPrincipalName" = $CurrentUser
-        "ArchiveSize" = $ArchiveSize
-        "ArchiveItems" = $ArchiveMailboxStats.ItemCount
-      }
-      $ArchiveMailboxList += $ArchiveStats
-    } catch {
-      Write-Error "Error getting info for mailbox: $CurrentUser"
-    }
-    $CurrentMailboxNum += 1
-  } while ($CurrentMailboxNum -lt $ArchiveMailboxesCount)
   $ArchiveMeasurementSize = $ArchiveMailboxList | Measure-Object -Property 'ArchiveSize' -Sum -Average
   $ArchiveMeasurementItems = $ArchiveMailboxList | Measure-Object -Property 'ArchiveItems' -Sum -Average
   $TotalArchiveSize = [math]::Round($($ArchiveMeasurementSize.Sum / $capacityMetric), 2)
@@ -826,22 +1110,23 @@ if ($SkipRecoverableItems -eq $true) {
     Write-Host "This may take awhile since stats need to be gathered per user" -foregroundcolor green
     Write-Host "Progress will be written as they are gathered" -foregroundcolor green
     Write-Host "If this keeps timing out, run script with SkipRecoverableItems $true option" -foregroundcolor green
-    $ConnectionUserPrincipalName = $(Get-ConnectionInformation).UserPrincipalName
-    # $ActionRequiredLogMessage = "[ACTION REQUIRED] In order to periodically refresh the connection to Microsoft, we need the User Principal Name used during the authentication process."
-    # $ActionRequiredPromptMessage = "Enter the User Principal Name"
-    $FirstInterval = 500
-    $SkipInternval = $FirstInterval
-    $ArchiveMailboxSizeGb = 0
-    $LargeAmountofArchiveMailboxCount = 5000
-    $FilterByField = 'User Principal Name'
-    Write-Host "[INFO] Retrieving all Exchange Mailbox Recoverable Items sizing"
+    if ($IsDelegatedAccess) {
+        $RIFMailboxList = @($IsolatedExchangeResults.RecoverableItemsMailboxes)
+    } else {
+        $ConnectionUserPrincipalName = $(Get-ConnectionInformation).UserPrincipalName
+        $FirstInterval = 500
+        $SkipInternval = $FirstInterval
+        $ArchiveMailboxSizeGb = 0
+        $LargeAmountofArchiveMailboxCount = 5000
+        $FilterByField = 'User Principal Name'
+        Write-Host "[INFO] Retrieving all Exchange Mailbox Recoverable Items sizing"
 
-    # Get a list of all users with Recoverable Items shared/non-shared mailboxes in the tenant
-    $NonArchiveMailboxes = $ExchangeActiveUsers | Where-Object { $_.'Has Archive' -eq 'FALSE' }
-    $ArchiveMailboxes = $ExchangeActiveUsers | Where-Object { $_.'Has Archive' -eq 'TRUE' }
+        $NonArchiveMailboxes = $ExchangeActiveUsers | Where-Object { $_.'Has Archive' -eq 'FALSE' }
+        $ArchiveMailboxes = $ExchangeActiveUsers | Where-Object { $_.'Has Archive' -eq 'TRUE' }
 
-    $RIFMailboxList = Get-RIFMailboxStats -ExchangeUsers $NonArchiveMailboxes -IncludeArchiveMailbox 0
-    $RIFMailboxList += Get-RIFMailboxStats -ExchangeUsers $ArchiveMailboxes -IncludeArchiveMailbox 1
+        $RIFMailboxList = Get-RIFMailboxStats -ExchangeUsers $NonArchiveMailboxes -IncludeArchiveMailbox 0
+        $RIFMailboxList += Get-RIFMailboxStats -ExchangeUsers $ArchiveMailboxes -IncludeArchiveMailbox 1
+    }
 
     $RIFMailboxSize = $RIFMailboxList | Measure-Object -Property 'RIFSize' -Sum -Average
     $RIFMailboxItems = $RIFMailboxList | Measure-Object -Property 'RIFItems' -Sum -Average
